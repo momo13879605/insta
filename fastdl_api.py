@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-ربات FastDL + شکارچی APIها (نسخه مقاوم‌سازی‌شده در برابر ERR_CONNECTION_RESET)
+ربات FastDL + شکارچی APIها (نسخه نهایی و مقاوم)
 --------------------------------------------------------------------------------
-ویژگی‌های جدید:
-  • تشخیص خودکار پروکسی از متغیرهای محیطی و اتصال از طریق آن
-  • هشدار پیش از اجرا در صورت عدم وجود پروکسی
-  • تلاش مجدد خودکار با تاخیر تصادفی
-  • لاگ‌گیری کامل برای دیباگ
+ویژگی‌های کلیدی:
+  • ارسال مطمئن فرم با استفاده از تکنیک‌های جایگزین (JavaScript و کیبورد)
+  • شکار کامل تمام درخواست‌های شبکه پس از ارسال فرم
+  • استخراج هوشمندانه لینک‌های دانلود و اطلاعات ویدیو
+  • مدیریت خطا و تلاش مجدد
 ================================================================================
 """
 
@@ -17,9 +17,10 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from playwright.async_api import (
     async_playwright,
@@ -28,6 +29,7 @@ from playwright.async_api import (
     Page,
     Request,
     Response,
+    TimeoutError as PlaywrightTimeoutError,
 )
 from playwright_stealth import Stealth
 
@@ -41,136 +43,128 @@ USER_AGENT = (
 )
 DEFAULT_VIEWPORT = {"width": 1366, "height": 900}
 NAV_TIMEOUT_MS = 60_000
-RESULT_WAIT_MS = 15_000
-MAX_RETRIES = 3
+RESULT_WAIT_MS = 20_000  # زمان انتظار برای نتایج
+MAX_RETRIES = 2
 
 
 # ------------------------------------------------------------------ #
-#              تشخیص خودکار پروکسی از محیط
-# ------------------------------------------------------------------ #
-def detect_proxy() -> Optional[str]:
-    """
-    ترتیب اولویت:
-      1. پارامتر خط فرمان (در main مدیریت می‌شود)
-      2. متغیر BROWSE_PROXY (برای محیط‌های TUN/FakeIP)
-      3. HTTPS_PROXY
-      4. HTTP_PROXY
-    """
-    for var in ("BROWSE_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
-        val = os.environ.get(var)
-        if val:
-            print(f"🔌 پروکسی از متغیر محیطی {var} شناسایی شد: {val}")
-            return val
-    print("⚠️  هیچ پروکسی در متغیرهای محیطی یافت نشد (BROWSE_PROXY/HTTPS_PROXY/HTTP_PROXY).")
-    return None
-
-
-# ------------------------------------------------------------------ #
-#              شکارچی شبکه (بدون تغییر ساختاری)
+#              کلاس شکارچی شبکه (Network Capture)
 # ------------------------------------------------------------------ #
 class NetworkCapture:
+    """ضبط تمام درخواست‌ها و پاسخ‌های شبکه، با تمرکز بر APIها."""
+
     def __init__(self) -> None:
-        self.all_requests: list[Dict[str, Any]] = []
-        self.all_responses: list[Dict[str, Any]] = []
-        self.api_calls: list[Dict[str, Any]] = []
+        self.requests: List[Dict[str, Any]] = []
+        self.responses: List[Dict[str, Any]] = []
+        self.api_calls: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
 
     async def on_request(self, request: Request) -> None:
         entry = {
-            "type": "request",
             "method": request.method,
             "url": request.url,
             "resource_type": request.resource_type,
+            "post_data": request.post_data,
             "headers": dict(request.headers),
-            "post_data": request.post_data if request.post_data else None,
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
         }
         async with self._lock:
-            self.all_requests.append(entry)
+            self.requests.append(entry)
 
     async def on_response(self, response: Response) -> None:
         entry: Dict[str, Any] = {
-            "type": "response",
             "status": response.status,
             "url": response.url,
             "headers": dict(response.headers),
             "body": None,
-            "body_size": None,
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
         }
+        # فقط بدنه‌های متنی/JSON را می‌خوانیم
         try:
             content_type = response.headers.get("content-type", "").lower()
-            is_texty = any(
-                t in content_type
-                for t in ("json", "javascript", "text", "xml", "html", "plain")
-            )
-            if is_texty:
-                body = await response.text()
+            if any(t in content_type for t in ("json", "text", "javascript", "xml", "html")):
+                body_text = await response.text()
                 try:
-                    entry["body"] = json.loads(body)
+                    entry["body"] = json.loads(body_text)
                 except (json.JSONDecodeError, ValueError):
-                    entry["body"] = body[:5000]
-                entry["body_size"] = len(body)
-            else:
-                entry["body"] = f"<binary:{content_type}>"
+                    entry["body"] = body_text[:10000]  # محدودیت حجم
         except Exception as exc:
             entry["body"] = f"<error: {exc}>"
 
         async with self._lock:
-            self.all_responses.append(entry)
-            if self._looks_like_api(response):
+            self.responses.append(entry)
+            # تشخیص API: پاسخ JSON یا URL شامل api
+            if self._is_api(response, entry):
                 self.api_calls.append(entry)
 
     @staticmethod
-    def _looks_like_api(response: Response) -> bool:
+    def _is_api(response: Response, entry: Dict[str, Any]) -> bool:
         url = response.url.lower()
-        ctype = response.headers.get("content-type", "").lower()
-        if "application/json" in ctype:
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/json" in content_type:
             return True
-        if any(k in url for k in ("/api/", "graphql", "/ajax/", "xhr", ".json")):
+        if any(k in url for k in ("/api/", "graphql", "/ajax/", "get_", "search")):
             return True
         return False
 
     def summary(self) -> Dict[str, Any]:
         return {
-            "total_requests": len(self.all_requests),
-            "total_responses": len(self.all_responses),
-            "api_calls_detected": len(self.api_calls),
+            "total_requests": len(self.requests),
+            "total_responses": len(self.responses),
+            "api_calls": len(self.api_calls),
         }
 
 
 # ------------------------------------------------------------------ #
 #                استخراج داده از صفحه نتیجه
 # ------------------------------------------------------------------ #
-async def extract_result_page(page: Page) -> Dict[str, Any]:
-    return {
-        "title": await page.title(),
-        "url": page.url,
-        "download_links": await page.eval_on_selector_all(
-            "a[href]",
-            """els => els
-                .map(e => ({href: e.href, text: e.innerText.trim().substring(0, 200)}))
-                .filter(e => /download|dl|media|cdn/i.test(e.href) || /download/i.test(e.text))""",
-        ),
-        "images": await page.eval_on_selector_all(
-            "img",
-            """els => els
-                .map(e => ({src: e.currentSrc || e.src, alt: e.alt}))
-                .filter(e => e.src && !e.src.startsWith('data:'))""",
-        ),
-        "videos": await page.eval_on_selector_all(
-            "video, video source", "els => els.map(e => e.src || e.getAttribute('src'))"
-        ),
-        "headings": await page.eval_on_selector_all(
-            "h1, h2, h3", "els => els.map(e => e.innerText.trim().substring(0, 300))"
-        ),
+async def extract_results(page: Page) -> Dict[str, Any]:
+    """استخراج لینک‌های دانلود، تصاویر و اطلاعات از صفحه نتایج."""
+    results: Dict[str, Any] = {
+        "page_title": await page.title(),
+        "page_url": page.url,
+        "download_links": [],
+        "video_previews": [],
+        "images": [],
+        "text_content": "",
     }
 
+    # 1. لینک‌های دانلود (بر اساس href حاوی download یا cdn)
+    links = await page.eval_on_selector_all(
+        "a[href]",
+        """els => els
+            .map(e => ({href: e.href, text: e.innerText.trim()}))
+            .filter(l => /download|dl|cdn|media|video|photo/i.test(l.href))""",
+    )
+    results["download_links"] = links
+
+    # 2. ویدیوها و پیش‌نمایش‌ها
+    videos = await page.eval_on_selector_all(
+        "video, video source, img[src*='cdninstagram'], img[src*='fbcdn']",
+        """els => els.map(e => e.src || e.getAttribute('src'))""",
+    )
+    results["video_previews"] = [v for v in videos if v]
+
+    # 3. تصاویر
+    results["images"] = await page.eval_on_selector_all(
+        "img",
+        """els => els
+            .map(e => e.src)
+            .filter(src => src && !src.startsWith('data:'))""",
+    )
+
+    # 4. متن اصلی صفحه (برای خطاها یا پیام‌ها)
+    results["text_content"] = await page.eval_on_selector(
+        "body", "el => el.innerText.substring(0, 3000)"
+    )
+
+    return results
+
 
 # ------------------------------------------------------------------ #
-#                      اجرای اصلی با تلاش مجدد
+#                      منطق اصلی ربات
 # ------------------------------------------------------------------ #
-async def run_bot_once(
+async def run_once(
     *,
     instagram_url: str,
     headless: bool,
@@ -189,157 +183,197 @@ async def run_bot_once(
                 "--no-sandbox",
             ],
         )
-
         ctx_kwargs: Dict[str, Any] = {
             "viewport": DEFAULT_VIEWPORT,
             "user_agent": USER_AGENT,
             "ignore_https_errors": True,
-            "locale": "en-US",
-            "timezone_id": "America/New_York",
         }
         if proxy:
             ctx_kwargs["proxy"] = {"server": proxy}
-            print(f"🔌 استفاده از پروکسی: {proxy}")
 
         context: BrowserContext = await browser.new_context(**ctx_kwargs)
         page: Page = await context.new_page()
-
         await Stealth().apply_stealth_async(page)
+
+        # اتصال شنودکننده‌ها
         page.on("request", capture.on_request)
         page.on("response", capture.on_response)
 
-        # 1) باز کردن سایت
-        print("⏳ باز کردن صفحه FastDL ...")
+        # 1) باز کردن صفحه اصلی
+        print("⏳ بارگذاری صفحه اصلی ...")
         await page.goto(
             "https://fastdl.app/en5IW",
             wait_until="domcontentloaded",
             timeout=NAV_TIMEOUT_MS,
         )
-        await page.wait_for_timeout(random.uniform(800, 1500))
+        await page.wait_for_timeout(2000)
 
-        # 2) پر کردن و ارسال فرم
+        # 2) پر کردن فیلد ورودی
         print(f"✍️  وارد کردن لینک: {instagram_url}")
-        await page.fill("#search-form-input", instagram_url, timeout=10_000)
-        await page.wait_for_timeout(random.uniform(300, 700))
+        try:
+            # استفاده از evaluate برای اطمینان از مقداردهی
+            await page.evaluate(
+                """(url) => {
+                    const input = document.querySelector('#search-form-input');
+                    if (input) {
+                        input.value = url;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""",
+                instagram_url,
+            )
+            await page.wait_for_timeout(500)
+        except Exception as e:
+            print(f"⚠️ خطا در پر کردن فیلد: {e}")
 
+        # 3) ارسال فرم (سه روش جایگزین برای اطمینان)
         print("🚀 ارسال فرم ...")
+        submitted = False
+        # روش الف: کلیک روی دکمه
         try:
-            async with page.expect_navigation(timeout=RESULT_WAIT_MS):
-                await page.click("#searchFormButton", timeout=10_000)
+            await page.click("#searchFormButton", timeout=5000, force=True)
+            submitted = True
+            print("✅ ارسال با کلیک روی دکمه.")
         except Exception:
-            await page.wait_for_timeout(3000)
+            print("⚠️ کلیک روی دکمه ناموفق بود، تلاش با روش‌های جایگزین...")
 
-        # 3) صبر برای APIها
-        print("⏳ در انتظار بارگذاری نتایج و APIها ...")
-        await page.wait_for_timeout(RESULT_WAIT_MS // 2)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
+        if not submitted:
+            # روش ب: ارسال فرم با JavaScript
+            try:
+                await page.evaluate("document.querySelector('#searchForm').submit()")
+                submitted = True
+                print("✅ ارسال با JavaScript.")
+            except Exception:
+                print("⚠️ ارسال با JavaScript ناموفق بود.")
 
-        # 4) استخراج داده
-        result_data = await extract_result_page(page)
+        if not submitted:
+            # روش ج: فشار دادن Enter در فیلد ورودی
+            try:
+                await page.press("#search-form-input", "Enter")
+                submitted = True
+                print("✅ ارسال با کلید Enter.")
+            except Exception:
+                print("⚠️ ارسال با Enter ناموفق بود.")
 
+        if not submitted:
+            await browser.close()
+            raise RuntimeError("هیچ‌کدام از روش‌های ارسال فرم موفق نبود.")
+
+        # 4) انتظار برای بارگذاری نتایج و شکار APIها
+        print("⏳ در انتظار نتایج و APIها ...")
+        await page.wait_for_timeout(RESULT_WAIT_MS)
+
+        # 5) استخراج داده از صفحه نتیجه
+        print("📄 استخراج داده‌های صفحه نتیجه ...")
+        result_data = await extract_results(page)
+
+        # ذخیره اسکرین‌شات
         screenshot_path = str(Path(output_path).with_suffix(".png"))
         await page.screenshot(path=screenshot_path, full_page=True)
 
         await context.close()
         await browser.close()
 
-    final_output = {
+    # ساخت خروجی نهایی
+    output = {
         "_meta": {
             "instagram_url": instagram_url,
             "proxy_used": proxy or "none",
-            "extracted_at": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
             "screenshot": screenshot_path,
             "network_summary": capture.summary(),
         },
         "page_result": result_data,
         "network_capture": {
             "api_calls": capture.api_calls,
-            "all_requests_sample": capture.all_requests[:200],
-            "all_responses_sample": capture.all_responses[:200],
+            "all_requests": capture.requests,
+            "all_responses": capture.responses,
         },
     }
 
-    out_file = Path(output_path).expanduser().resolve()
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    with out_file.open("w", encoding="utf-8") as fh:
-        json.dump(final_output, fh, ensure_ascii=False, indent=2)
+    # ذخیره در فایل
+    out_path = Path(output_path).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        json.dump(output, fh, ensure_ascii=False, indent=2)
 
-    print(f"\n💾 خروجی ذخیره شد: {out_file}")
+    print(f"\n💾 خروجی ذخیره شد: {out_path}")
     print(f"🖼️  اسکرین‌شات: {screenshot_path}")
     print(f"📊 خلاصه شبکه: {capture.summary()}")
-    return final_output
+    return output
 
 
-async def run_bot_with_retry(
+# ------------------------------------------------------------------ #
+#                    اجرای اصلی با تلاش مجدد
+# ------------------------------------------------------------------ #
+async def run_with_retry(
     *,
     instagram_url: str,
     headless: bool,
     proxy: Optional[str],
     output_path: str,
 ) -> Dict[str, Any]:
-    """اجرای ربات با تلاش مجدد خودکار در صورت خطاهای شبکه."""
-    last_exc: Optional[Exception] = None
+    last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             print(f"\n🔄 تلاش {attempt}/{MAX_RETRIES} ...")
-            return await run_bot_once(
+            return await run_once(
                 instagram_url=instagram_url,
                 headless=headless,
                 proxy=proxy,
                 output_path=output_path,
             )
         except Exception as exc:
-            last_exc = exc
-            msg = str(exc)
-            if "ERR_CONNECTION_RESET" in msg or "ERR_TUNNEL_CONNECTION_FAILED" in msg:
-                wait = random.uniform(2.0, 5.0)
-                print(f"⚠️  خطای شبکه در تلاش {attempt}: {exc}")
+            last_error = exc
+            print(f"⚠️ خطا در تلاش {attempt}: {exc}")
+            if attempt < MAX_RETRIES:
+                wait = random.uniform(3, 7)
                 print(f"⏳ تلاش مجدد پس از {wait:.1f} ثانیه ...")
                 await asyncio.sleep(wait)
-                continue
             else:
-                raise  # خطای غیرشبکه‌ای → توقف فوری
+                raise
 
-    raise RuntimeError(
-        f"پس از {MAX_RETRIES} تلاش، اتصال به fastdl.app برقرار نشد. "
-        f"آخرین خطا: {last_exc}\n"
-        "💡 راه‌حل: یک پروکسی/VPN فعال کنید و متغیر BROWSE_PROXY را تنظیم کنید."
-    ) from last_exc
+    raise RuntimeError(f"پس از {MAX_RETRIES} تلاش ناموفق بود: {last_error}")
 
 
 # ------------------------------------------------------------------ #
-#                    ورودی تعاملی و CLI
+#                        ورودی تعاملی و CLI
 # ------------------------------------------------------------------ #
 def prompt_user() -> Dict[str, Any]:
     print("\n" + "═" * 60)
-    print("  🤖 ربات FastDL + شکارچی APIهای شبکه")
+    print("  🤖 ربات FastDL + شکارچی API (نسخه نهایی)")
     print("═" * 60)
 
     while True:
-        ig_url = input("\n🔗 لینک اینستاگرام: ").strip()
-        if not ig_url:
-            continue
-        if "instagram.com" not in ig_url:
-            print("⚠️  لینک معتبر نیست.")
-            continue
-        break
+        url = input("\n🔗 لینک اینستاگرام: ").strip()
+        if url and "instagram.com" in url:
+            break
+        print("⚠️ لینک معتبر نیست. دوباره تلاش کنید.")
 
     headed = input("👁️  مرورگر قابل مشاهده باشد؟ (y/N): ").strip().lower() in ("y", "yes", "بله", "ب")
-    default_out = f"fastdl_{datetime.now():%Y%m%d_%H%M%S}.json"
+
+    default_out = f"fastdl_result_{datetime.now():%Y%m%d_%H%M%S}.json"
     out = input(f"💾 فایل خروجی [{default_out}]: ").strip() or default_out
-    return {"instagram_url": ig_url, "headed": headed, "output": out}
+
+    return {"url": url, "headed": headed, "output": out}
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("instagram_url", nargs="?", default=None)
-    p.add_argument("--headed", action="store_true")
-    p.add_argument("-o", "--output", default=None)
-    p.add_argument("--proxy", default=None, help="مثال: http://127.0.0.1:8080 یا socks5://...")
+    p = argparse.ArgumentParser(description="ربات FastDL + شکار API")
+    p.add_argument("instagram_url", nargs="?", default=None, help="لینک اینستاگرام")
+    p.add_argument("--headed", action="store_true", help="مرورگر قابل مشاهده")
+    p.add_argument("-o", "--output", default=None, help="فایل خروجی JSON")
+    p.add_argument("--proxy", default=None, help="پروکسی (مثال: http://127.0.0.1:8080)")
     return p.parse_args()
+
+
+def detect_proxy() -> Optional[str]:
+    for var in ("BROWSE_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
+        if os.environ.get(var):
+            print(f"🔌 پروکسی از {var} شناسایی شد.")
+            return os.environ[var]
+    return None
 
 
 async def async_main() -> None:
@@ -349,31 +383,30 @@ async def async_main() -> None:
         config = {
             "instagram_url": args.instagram_url.strip(),
             "headed": args.headed,
-            "output": args.output or f"fastdl_{datetime.now():%Y%m%d_%H%M%S}.json",
-            "proxy": args.proxy,
+            "output": args.output or f"fastdl_result_{datetime.now():%Y%m%d_%H%M%S}.json",
+            "proxy": args.proxy or detect_proxy(),
         }
     else:
         cfg = prompt_user()
-        config = {**cfg, "proxy": args.proxy}
+        config = {
+            "instagram_url": cfg["url"],
+            "headed": cfg["headed"],
+            "output": cfg["output"],
+            "proxy": detect_proxy(),
+        }
 
-    # اگر پروکسی صریح داده نشده، از محیط بخوان
     if not config["proxy"]:
-        config["proxy"] = detect_proxy()
-
-    # هشدار نهایی اگر پروکسی وجود ندارد
-    if not config["proxy"]:
-        print("\n⚠️  هشدار: پروکسی فعال نیست. اگر IP شما توسط Cloudflare مسدود باشد،")
-        print("   اتصال با ERR_CONNECTION_RESET قطع خواهد شد.\n")
+        print("⚠️ هشدار: پروکسی فعال نیست. در صورت مسدود بودن IP، اتصال قطع می‌شود.")
 
     try:
-        await run_bot_with_retry(
+        await run_with_retry(
             instagram_url=config["instagram_url"],
             headless=not config["headed"],
             proxy=config["proxy"],
             output_path=config["output"],
         )
     except Exception as exc:
-        print(f"\n❌ خطا: {exc}", file=sys.stderr)
+        print(f"\n❌ خطای نهایی: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
